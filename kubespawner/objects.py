@@ -336,7 +336,6 @@ def make_pod(
     if mem_limit:
         notebook_container.resources.limits['memory'] = mem_limit
     if extra_resource_limits:
-
         notebook_container.resources.limits.update(extra_resource_limits)
 
     if extra_container_config:
