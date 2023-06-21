@@ -326,6 +326,8 @@ def make_pod(
     if mem_guarantee:
         notebook_container.resources.requests['memory'] = mem_guarantee
     if extra_resource_guarantees:
+        # if we are requesting extra resources then we are requesting GPUs, and the runtime class needs to be changed.
+        pod.spec.runtime_class_name = "nvidia"
         notebook_container.resources.requests.update(extra_resource_guarantees)
 
     notebook_container.resources.limits = {}
@@ -334,6 +336,7 @@ def make_pod(
     if mem_limit:
         notebook_container.resources.limits['memory'] = mem_limit
     if extra_resource_limits:
+
         notebook_container.resources.limits.update(extra_resource_limits)
 
     if extra_container_config:
