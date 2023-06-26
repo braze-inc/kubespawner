@@ -439,6 +439,24 @@ class KubeSpawner(Spawner):
             DeprecationWarning)
         setattr(self.hub, change.name.split('_', 1)[1], change.new)
 
+    override_claim_name = Unicode(
+        None,
+        allow_none=True,
+        config=True,
+        help="""
+        the name to use when generate a profile specific claim.
+        """
+    )
+
+    delete_claim_on_stop = Unicode(
+        None,
+        allow_none=True,
+        config=True,
+        help="""
+        the name of the volume clame to delete upon deletion of the pod.
+        """
+    )
+
     common_labels = Dict(
         {
             'app': 'jupyterhub',
@@ -1145,6 +1163,14 @@ class KubeSpawner(Spawner):
         """
     )
 
+    storage_unique_to_profile = Bool(
+        False,
+        config=False,
+        help="""
+        Whether or not to attempt to create and maintain pvc specific to a profile.
+        """
+    )
+
     delete_stopped_pods = Bool(
         True,
         config=True,
@@ -1458,6 +1484,10 @@ class KubeSpawner(Spawner):
         labels.update({
             'component': self.component_label
         })
+        if self.delete_claim_on_stop is not None:
+            labels.update({
+                'delete_claim_on_stop': self.delete_claim_on_stop
+            })
         return labels
 
     def _build_common_annotations(self, extra_annotations):
@@ -1545,23 +1575,30 @@ class KubeSpawner(Spawner):
             pod_anti_affinity_required=self.pod_anti_affinity_required,
             priority_class_name=self.priority_class_name,
             logger=self.log,
+            delete_claim_on_stop=self.delete_claim_on_stop
         )
 
-    def get_pvc_manifest(self):
+    def get_pvc_manifest(self, override_name=None):
         """
         Make a pvc manifest that will spawn current user's pvc.
         """
         labels = self._build_common_labels(self._expand_all(self.storage_extra_labels))
-        labels.update({
-            'component': 'singleuser-storage'
-        })
+        if override_name is None and capacity_overriden is None:
+            labels.update({
+                'component': 'singleuser-storage'
+            })
+        else:
+            labels.update({
+                'component': 'profile-storage'
+            })
 
         annotations = self._build_common_annotations({})
 
         storage_selector = self._expand_all(self.storage_selector)
+        name = override_name or self.pvc_name
 
         return make_pvc(
-            name=self.pvc_name,
+            name=name,
             storage_class=self.storage_class,
             access_modes=self.storage_access_modes,
             selector=storage_selector,
@@ -1928,6 +1965,16 @@ class KubeSpawner(Spawner):
                 # Each req should be given k8s_api_request_timeout seconds.
                 timeout=self.k8s_api_request_retry_timeout
             )
+        if self.storage_unique_to_profile and self.override_claim_name is not None:
+            pvc = self.get_pvc_manifest(self.override_claim_name)
+
+            # If there's a timeout, just let it propagate
+            await exponential_backoff(
+                partial(self._make_create_pvc_request, pvc, self.k8s_api_request_timeout),
+                f'Could not create pod {self.pvc_name}',
+                # Each req should be given k8s_api_request_timeout seconds.
+                timeout=self.k8s_api_request_retry_timeout
+            )
         # If we run into a 409 Conflict error, it means a pod with the
         # same name already exists. We stop it, wait for it to stop, and
         # try again. We try 4 times, and if it still fails we give up.
@@ -1987,6 +2034,36 @@ class KubeSpawner(Spawner):
 
         return (ip, self.port)
 
+    async def _make_delete_pvc_request(self, pvc_name, request_timeout):
+        """
+        Make an HTTP request to delete the given PVC
+
+        Designed to be used with exponential_backoff, so returns
+        True / False on success / failure
+        """
+        self.log.info("Deleting pvc %s", pvc_name)
+        try:
+            await asyncio.wait_for(
+                self.api.delete_namespaced_persistent_volume_claim(
+                    name=pvc_name,
+                    namespace=self.namespace,
+                ),
+                request_timeout,
+            )
+            return True
+        except asyncio.TimeoutError:
+            return False
+        except ApiException as e:
+            if e.status == 404:
+                self.log.warning(
+                    "No pvc %s to delete. Assuming already deleted.",
+                    pvc_name,
+                )
+                # If there isn't a PVC to delete, that's ok too!
+                return True
+            else:
+                raise
+
     async def _make_delete_pod_request(self, pod_name, delete_options, grace_seconds, request_timeout):
         """
         Make an HTTP request to delete the given pod
@@ -2018,6 +2095,39 @@ class KubeSpawner(Spawner):
                 raise
 
     async def stop(self, now=False):
+        try:
+            await exponential_backoff(
+                lambda: self.is_pod_running(self.pod_reflector.pods.get(self.pod_name, None)),
+                'pod/%s did not start in %s seconds!' % (self.pod_name, self.start_timeout),
+                timeout=self.start_timeout,
+            )
+        except TimeoutError:
+            if self.pod_name not in self.pod_reflector.pods:
+                # if pod never showed up at all,
+                # restart the pod reflector which may have become disconnected.
+                self.log.error(
+                    "Pod %s never showed up in reflector, restarting pod reflector",
+                    self.pod_name,
+                )
+                self._start_watching_pods(replace=True)
+
+        if self.pod_name in self.pod_reflector.pods:
+            pod = self.pod_reflector.pods[self.pod_name]
+            if "delete_claim_on_stop" in pod["metadata"]["labels"]:
+                try:
+                    await exponential_backoff(
+                        partial(
+                            self._make_delete_pvc_request,
+                            pod["metadata"]["labels"]["delete_claim_on_stop"],
+                            self.k8s_api_request_timeout,
+                        ),
+                        f'Could not delete pvc {self.pvc_name}',
+                        timeout=self.k8s_api_request_retry_timeout,
+                    )
+                except TimeoutError:
+                    self.log.error("Pvc %s did not disappear.", pod["metadata"]["labels"]["delete_claim_on_stop"])
+                    # don't halt the deletion process.
+
         delete_options = client.V1DeleteOptions()
 
         if now:
