@@ -1583,7 +1583,7 @@ class KubeSpawner(Spawner):
         Make a pvc manifest that will spawn current user's pvc.
         """
         labels = self._build_common_labels(self._expand_all(self.storage_extra_labels))
-        if override_name is None and capacity_overriden is None:
+        if override_name is None
             labels.update({
                 'component': 'singleuser-storage'
             })
