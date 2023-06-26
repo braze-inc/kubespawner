@@ -1575,7 +1575,6 @@ class KubeSpawner(Spawner):
             pod_anti_affinity_required=self.pod_anti_affinity_required,
             priority_class_name=self.priority_class_name,
             logger=self.log,
-            delete_claim_on_stop=self.delete_claim_on_stop
         )
 
     def get_pvc_manifest(self, override_name=None):
